@@ -22,121 +22,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sqlite3 zstd curl jq
 
-      - name: Initialize Shard SQLite Schema
-        run: |
-          mkdir -p output
-          sqlite3 output/github_shard.db << 'EOF'
-          PRAGMA journal_mode = WAL;
-          CREATE TABLE IF NOT EXISTS applications (
-              id TEXT PRIMARY KEY,
-              name TEXT NOT NULL,
-              description TEXT,
-              homepage TEXT,
-              source_repo TEXT NOT NULL,
-              forge_type TEXT NOT NULL,
-              license TEXT,
-              stars INTEGER DEFAULT 0,
-              created_at INTEGER,
-              updated_at INTEGER
-          );
-          CREATE TABLE IF NOT EXISTS releases (
-              id TEXT PRIMARY KEY,
-              app_id TEXT NOT NULL,
-              tag_name TEXT NOT NULL,
-              published_at INTEGER NOT NULL,
-              changelog TEXT,
-              FOREIGN KEY(app_id) REFERENCES applications(id) ON DELETE CASCADE
-          );
-          CREATE TABLE IF NOT EXISTS assets (
-              id TEXT PRIMARY KEY,
-              release_id TEXT NOT NULL,
-              file_name TEXT NOT NULL,
-              download_url TEXT NOT NULL,
-              file_size INTEGER,
-              sha256 TEXT,
-              cpu_arch TEXT NOT NULL,
-              package_type TEXT NOT NULL,
-              interface_type TEXT NOT NULL,
-              gui_toolkit TEXT,
-              FOREIGN KEY(release_id) REFERENCES releases(id) ON DELETE CASCADE
-          );
-          EOF
-
-      - name: Ingest Public GitHub Releases (Zero-Leakage Rate-Safe)
+      - name: Execute GitHub Harvester Engine
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "GitHub genel sürümleri taranıyor..."
-          # Public events ve release beslemeleri taranır
-          REPOS=(
-            "BurntSushi/ripgrep"
-            "sharkdp/fd"
-            "sharkdp/bat"
-            "eza-community/eza"
-            "dandavison/delta"
-            "starship/starship"
-            "bootandy/dust"
-            "ducaale/xh"
-            "zellij-org/zellij"
-            "helix-editor/helix"
-          )
-
-          for repo in "${REPOS[@]}"; do
-            echo "Tarama yapılıyor: $repo"
-            RESP=$(curl -s -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              "https://api.github.com/repos/$repo/releases/latest" || true)
-
-            TAG=$(echo "$RESP" | jq -r '.tag_name // empty')
-            if [ -n "$TAG" ]; then
-              APP_ID="github:$repo"
-              NAME=$(basename "$repo")
-              DESC=$(echo "$RESP" | jq -r '.name // empty')
-              PUB_AT=$(date +%s)
-              REL_ID="${APP_ID}:${TAG}"
-
-              sqlite3 output/github_shard.db "INSERT OR REPLACE INTO applications (id, name, description, source_repo, forge_type, updated_at) VALUES ('$APP_ID', '$NAME', '$DESC', 'https://github.com/$repo', 'github', $PUB_AT);"
-              sqlite3 output/github_shard.db "INSERT OR REPLACE INTO releases (id, app_id, tag_name, published_at) VALUES ('$REL_ID', '$APP_ID', '$TAG', $PUB_AT);"
-
-              # Varlıkları incele
-              echo "$RESP" | jq -c '.assets[]?' | while read -r asset; do
-                FNAME=$(echo "$asset" | jq -r '.name')
-                URL=$(echo "$asset" | jq -r '.browser_download_url')
-                SIZE=$(echo "$asset" | jq -r '.size // 0')
-                ASSET_ID="${REL_ID}:${FNAME}"
-
-                # CPU Mimari Sınıflandırma
-                ARCH="x86_64"
-                if [[ "$FNAME" =~ (aarch64|arm64) ]]; then
-                  ARCH="aarch64"
-                elif [[ "$FNAME" =~ (armv7|armhf) ]]; then
-                  ARCH="armv7"
-                elif [[ "$FNAME" =~ (riscv64) ]]; then
-                  ARCH="riscv64"
-                fi
-
-                # Paket Türü
-                PKG="binary"
-                if [[ "$FNAME" =~ \.tar\.(gz|xz|zst)$ ]]; then
-                  PKG="tarball"
-                elif [[ "$FNAME" =~ \.AppImage$ ]]; then
-                  PKG="appimage"
-                elif [[ "$FNAME" =~ \.deb$ ]]; then
-                  PKG="deb"
-                elif [[ "$FNAME" =~ \.rpm$ ]]; then
-                  PKG="rpm"
-                fi
-
-                sqlite3 output/github_shard.db "INSERT OR REPLACE INTO assets (id, release_id, file_name, download_url, file_size, cpu_arch, package_type, interface_type) VALUES ('$ASSET_ID', '$REL_ID', '$FNAME', '$URL', $SIZE, '$ARCH', '$PKG', 'cli');"
-              done
-            fi
-          done
-
-      - name: Vacuum and Verify Shard DB
-        run: |
-          sqlite3 output/github_shard.db "VACUUM;"
-          sqlite3 output/github_shard.db "SELECT count(*) AS app_count FROM applications;"
-          sqlite3 output/github_shard.db "SELECT count(*) AS asset_count FROM assets;"
+          mkdir -p output
+          chmod +x scripts/harvest-github.sh
+          ./scripts/harvest-github.sh output/github_shard.db
 
       - name: Publish Shard Artifact to Latest Release
         uses: softprops/action-gh-release@v2
